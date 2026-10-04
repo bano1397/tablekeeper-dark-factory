@@ -242,6 +242,36 @@ def test_combination_booking_end_to_end(page):
     assert "Window" in text and "Garden" in text
 
 
+def test_combination_lost_response_recovers_original(page):
+    reset()
+    open_form(page, cell="slot-t_1+t_2-19:00", party=6)
+    page.route("**/reservations", lambda route: (route.fetch(), route.abort("connectionreset")))
+    page.click(sel("booking-submit"))
+    page.wait_for_selector(sel("booking-uncertain"))
+    assert page.query_selector(sel("confirmation")) is None
+    page.unroute("**/reservations")
+    page.click(sel("booking-submit"))
+    page.wait_for_selector(sel("confirmation"))
+    booked = confirmed_for(ADA["email"])
+    assert len(booked) == 1 and booked[0]["table_ids"] == ["t_1", "t_2"]
+    assert page.text_content(sel("confirmation-reference")).strip() == booked[0]["reference"]
+    assert page.query_selector(sel("booking-uncertain")) is None
+
+
+def test_combination_conflict_keeps_form_and_shows_error(page):
+    reset()
+    open_form(page, cell="slot-t_1+t_2-19:00", party=5)
+    httpx.post(f"{BASE}/reservations", headers={"Authorization": f"Bearer {token(BOB['email'])}",
+                                                "Idempotency-Key": uuid.uuid4().hex},
+               json={"restaurant_id": "r_anker", "table_id": "t_1", "starts_at_local": f"{DATE}T19:30", "party_size": 2})
+    page.click(sel("booking-submit"))
+    page.wait_for_selector(sel("booking-error"))
+    assert page.query_selector(sel("confirmation")) is None
+    assert page.input_value(sel("booking-party-size")) == "5"
+    page.wait_for_function(
+        "document.querySelector(\"[data-testid='slot-t_1+t_2-19:00']\").dataset.available === 'false'")
+
+
 def test_combination_cells_only_for_pairs_that_fit(page):
     reset()
     search(page, party=7)

@@ -222,3 +222,30 @@ test('screens are HTML; assets are served locally', async () => {
   }
   assert.equal((await fetch(`${base}/assets/nope.js`)).status, 404);
 });
+
+test('concurrent PATCHes onto overlapping pairs serialize: one winner', async () => {
+  const { ada, bob } = await world();
+  const a = (await book(ada, { table_id: 't_4' })).body;
+  const b = (await book(bob, { table_id: 't_4', starts_at_local: `${date}T21:00` })).body;
+  const c = (await book(ada, { table_id: 't_3', starts_at_local: `${date}T21:00` })).body;
+  // a -> {t_1,t_2}, b -> {t_2,t_3} at 19:00 (shares t_2 with a), c -> {t_2} at 19:00.
+  const out = await Promise.all([
+    call('PATCH', `/reservations/${a.reference}`, { token: ada, body: { table_ids: ['t_1', 't_2'] } }),
+    call('PATCH', `/reservations/${b.reference}`, { token: bob, body: { table_ids: ['t_2', 't_3'], starts_at_local: `${date}T19:00` } }),
+    call('PATCH', `/reservations/${c.reference}`, { token: ada, body: { table_id: 't_2', starts_at_local: `${date}T19:00` } }),
+  ]);
+  assert.equal(out.filter((r) => r.status === 200).length, 1, JSON.stringify(out.map((r) => r.status)));
+  assert.ok(out.every((r) => r.status === 200 || (r.status === 409 && r.body.error.code === 'table_unavailable')));
+  const slot = await slotAt(1);
+  assert.ok(!slot.available_table_ids.includes('t_2'));
+});
+
+test('64-character ID limit applies to fixture table and reservation ids', async () => {
+  const long = 'x'.repeat(65);
+  const tables = [{ id: long, label: 'L', capacity: 2 }];
+  expectError(await call('POST', '/_test/reset', { body: { users: [], restaurants: [restaurant({ tables, combinable: [] })] } }), 422, 'validation_failed');
+  const ok = [{ id: 'y'.repeat(64), label: 'L', capacity: 2 }];
+  assert.equal((await call('POST', '/_test/reset', { body: { users: [], restaurants: [restaurant({ tables: ok, combinable: [] })] } })).status, 204);
+  const seed = { id: long, reference: 'SEED01', user_id: 'u_ada', restaurant_id: 'r_anker', table_id: 't_1', starts_at_local: `${date}T19:00`, party_size: 2 };
+  expectError(await call('POST', '/_test/reset', { body: { users: [ADA], restaurants: [restaurant()], reservations: [seed] } }), 422, 'validation_failed');
+});
