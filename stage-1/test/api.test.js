@@ -361,3 +361,73 @@ test('unknown routes and the error envelope', async () => {
   const health = await call('GET', '/health');
   assert.deepEqual(health.body, { status: 'ok' });
 });
+
+// ---- auditor gap list: concurrency, no-op moves, import replacement ------------------
+
+test('concurrent cancel-and-rebook of one table ends with one confirmed booking', async () => {
+  const { ada, bob } = await world();
+  const ref = (await book(ada)).body.reference;
+  const out = await Promise.all([
+    call('POST', `/reservations/${ref}/cancel`, { token: ada }),
+    ...Array.from({ length: 30 }, (_, i) => book(i % 2 ? ada : bob)),
+  ]);
+  assert.ok(out.every((r) => r.status < 500));
+  const slots = (await call('GET', `/availability?restaurant_id=r_anker&date=${futureDate()}&party_size=4`)).body.slots;
+  assert.ok(!slots.find((s) => s.starts_at_local.endsWith('19:00')).available_table_ids.includes('t_2'));
+  const all = [...(await call('GET', '/reservations', { token: ada })).body.reservations,
+    ...(await call('GET', '/reservations', { token: bob })).body.reservations];
+  assert.equal(all.filter((r) => r.status === 'confirmed' && r.table_id === 't_2').length, 1);
+});
+
+test('concurrent PATCHes onto one free table: exactly one wins', async () => {
+  const { ada } = await world({
+    restaurants: [restaurant({ tables: Array.from({ length: 12 }, (_, i) => ({ id: `t_${i}`, label: `${i}`, capacity: 4 })) })],
+  });
+  const refs = [];
+  for (let i = 1; i < 12; i++) refs.push((await book(ada, { table_id: `t_${i}` })).body.reference);
+  const out = await Promise.all(refs.map((ref) => call('PATCH', `/reservations/${ref}`, { token: ada, body: { table_id: 't_0' } })));
+  assert.equal(out.filter((r) => r.status === 200).length, 1);
+  assert.equal(out.filter((r) => r.status === 409 && r.body.error.code === 'table_unavailable').length, 10);
+});
+
+test('moves: unchanged and no-op items are returned unchanged, unknown fields ignored', async () => {
+  const { ada } = await world();
+  const a = (await book(ada, { table_id: 't_1', party_size: 2 })).body;
+  const b = (await book(ada, { table_id: 't_2', party_size: 2 })).body;
+  const res = await call('POST', '/reservation-moves', {
+    token: ada, key: newKey(),
+    body: { moves: [{ reference: b.reference, souvenir: 1 }, { reference: a.reference, party_size: 1, extra: 'x' }] },
+  });
+  assert.equal(res.status, 201);
+  assert.deepEqual(res.body.reservations[0], b);
+  assert.deepEqual(res.body.reservations[1], { ...a, party_size: 1 });
+});
+
+test('moves: cutoff error of an earlier item wins over a later item', async () => {
+  const { ada } = await world();
+  const past = (await book(ada, { starts_at_local: '2020-01-02T19:00' })).body;
+  const fresh = (await book(ada, { table_id: 't_3' })).body;
+  const res = await call('POST', '/reservation-moves', {
+    token: ada, key: newKey(),
+    body: { moves: [{ reference: past.reference, table_id: 't_1' }, { reference: fresh.reference, starts_at_local: `${futureDate()}T19:15` }] },
+  });
+  expectError(res, 409, 'cutoff_passed');
+});
+
+test('import replaces destination users and keeps move receipts', async () => {
+  const { ada } = await world();
+  const a = (await book(ada, { table_id: 't_2' })).body;
+  const key = newKey();
+  const body = { moves: [{ reference: a.reference, table_id: 't_3' }] };
+  const first = await call('POST', '/reservation-moves', { token: ada, key, body });
+  const snapshot = (await call('GET', '/_test/export')).body;
+  await call('POST', '/_test/reset', { body: { users: [{ id: 'u_z', email: 'z@example.com', password: 'zzzzzzzz', display_name: 'Z' }], restaurants: [] } });
+  const zTok = (await call('POST', '/auth/login', { body: { email: 'z@example.com', password: 'zzzzzzzz' } })).body.token;
+  assert.equal((await call('POST', '/_test/import', { body: snapshot })).status, 204);
+  expectError(await call('GET', '/reservations', { token: zTok }), 401, 'unauthenticated');
+  expectError(await call('POST', '/auth/login', { body: { email: 'z@example.com', password: 'zzzzzzzz' } }), 401, 'unauthenticated');
+  const replay = await call('POST', '/reservation-moves', { token: ada, key, body });
+  assert.equal(replay.status, 200);
+  assert.deepEqual(replay.body, first.body);
+  assert.equal((await call('GET', `/reservations/${a.reference}`, { token: ada })).body.table_id, 't_3');
+});

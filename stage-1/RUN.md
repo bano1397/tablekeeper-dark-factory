@@ -33,6 +33,18 @@ PORT=8080 node src/server.js
 npm test        # node --test test/*.test.js — starts the server in-process on a free port
 ```
 
+## No-network load probe
+
+Runs the image the way the grader does (no network, 2 vCPU, 2 GiB) and drives 50
+in-flight requests from inside the container:
+
+```sh
+docker build -t tablekeeper-stage1 .
+CID=$(docker run -d --rm --network none --cpus 2 --memory 2g -e PORT=8080 tablekeeper-stage1)
+docker exec -i $CID node - < scripts/load.js    # prints LOAD OK
+docker stop $CID
+```
+
 ## Layout
 
 | Path | Contents |
