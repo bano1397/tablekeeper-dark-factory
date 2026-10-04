@@ -363,3 +363,67 @@ test('stage-3 exports import: series amend and replans work on imported data', a
   assert.equal(plan.status, 201);
   assert.equal((await apply(ada, plan.body.plan_id)).status, 201);
 });
+
+// ---- planning boundary and rank tie-breaks -----------------------------------------------------
+
+test('rank vector breaks ties between equal-cost plans, in reference order', async () => {
+  // Two bookings on the closed table, two identical free tables: both orders cost the same
+  // moves and seats, so the lexicographically smaller rank vector (by reference) wins.
+  const { ada } = await world({ restaurants: [restaurant({ tables: [
+    { id: 't_1', label: '1', capacity: 4 }, { id: 't_2', label: '2', capacity: 4 }, { id: 't_3', label: '3', capacity: 4 }],
+  combinable: [] })] });
+  const x = (await book(ada, { table_id: 't_2', starts_at_local: `${date}T18:00` })).body;
+  const y = (await book(ada, { table_id: 't_2', starts_at_local: `${date}T19:30` })).body;
+  await book(ada, { table_id: 't_1', starts_at_local: `${date}T21:00` }); // fixed, outside closure, no conflict
+  const res = (await preview(ada, close('t_2', date, '18:00', '21:00'))).body;
+  // Neither booking overlaps the other, so each independently takes rank 0 (t_1).
+  assert.deepEqual(res.assignments.map((a) => a.table_ids), [['t_1'], ['t_1']]);
+  assert.deepEqual(res.assignments.map((a) => a.reference), [x.reference, y.reference].sort());
+});
+
+test('rank vector: the smaller reference gets the better-ranked table when they compete', async () => {
+  const { ada } = await world({ restaurants: [restaurant({ tables: [
+    { id: 't_1', label: '1', capacity: 4 }, { id: 't_2', label: '2', capacity: 4 }, { id: 't_3', label: '3', capacity: 4 },
+    { id: 't_4', label: '4', capacity: 4 }], combinable: [] })] });
+  const p = (await book(ada, { table_id: 't_2' })).body;
+  const q = (await book(ada, { table_id: 't_4' })).body;
+  // Close t_2 and t_4 in two steps: first t_4 (q moves), then plan t_2 so both compete for t_1/t_3.
+  const first = (await preview(ada, close('t_4'))).body;
+  await apply(ada, first.plan_id);
+  const moved = (await call('GET', `/reservations/${q.reference}`, { token: ada })).body.table_ids;
+  assert.deepEqual(moved, ['t_1']); // rank 0 wins, single move
+  const second = (await preview(ada, close('t_2'))).body;
+  assert.equal(second.moved_count, 1);
+  assert.deepEqual(second.assignments.find((a) => a.reference === p.reference).table_ids, ['t_3']);
+});
+
+test('planning supports 6 tables, 4 pairs and 6 considered bookings quickly', async () => {
+  const tables = Array.from({ length: 6 }, (_, i) => ({ id: `t_${i + 1}`, label: `${i + 1}`, capacity: 2 + i }));
+  const combinable = [['t_1', 't_2'], ['t_2', 't_3'], ['t_3', 't_4'], ['t_5', 't_6']];
+  const { ada } = await world({ restaurants: [restaurant({ tables, combinable, opening_hours: allWeek('12:00', '23:30') })] });
+  const times = ['18:00', '18:00', '18:30', '18:30', '19:00', '21:00']; // the t_6 booking can move to t_1 once it frees up
+  const seats = ['t_1', 't_2', 't_3', 't_4', 't_5', 't_6'];
+  for (let i = 0; i < 6; i++) {
+    const r = await book(ada, { table_id: seats[i], starts_at_local: `${date}T${times[i]}`, party_size: 2 });
+    assert.equal(r.status, 201, JSON.stringify(r.body));
+  }
+  const t0 = Date.now();
+  const res = await preview(ada, close('t_6', date, '17:00', '23:00'));
+  const ms = Date.now() - t0;
+  assert.equal(res.status, 201, JSON.stringify(res.body));
+  assert.equal(res.body.assignments.length, 6);
+  assert.equal(res.body.moved_count, 1);
+  assert.ok(ms < 2000, `planning took ${ms} ms`);
+});
+
+test('worst case for the search: nothing fits, every option explored, still fast', async () => {
+  const tables = Array.from({ length: 6 }, (_, i) => ({ id: `t_${i + 1}`, label: `${i + 1}`, capacity: 6 }));
+  const combinable = [['t_1', 't_2'], ['t_3', 't_4'], ['t_5', 't_6'], ['t_2', 't_3']];
+  const { ada } = await world({ restaurants: [restaurant({ tables, combinable, opening_hours: allWeek('12:00', '23:30'), reservation_duration_minutes: 600 })] });
+  for (let i = 0; i < 6; i++) {
+    assert.equal((await book(ada, { table_id: `t_${i + 1}`, starts_at_local: `${date}T13:00`, party_size: 1 })).status, 201);
+  }
+  const t0 = Date.now();
+  expectError(await preview(ada, close('t_6', date, '12:00', '23:00')), 409, 'no_feasible_plan');
+  assert.ok(Date.now() - t0 < 4000, `search took ${Date.now() - t0} ms`);
+});
