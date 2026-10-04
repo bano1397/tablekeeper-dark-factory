@@ -427,3 +427,58 @@ test('worst case for the search: nothing fits, every option explored, still fast
   expectError(await preview(ada, close('t_6', date, '12:00', '23:00')), 409, 'no_feasible_plan');
   assert.ok(Date.now() - t0 < 4000, `search took ${Date.now() - t0} ms`);
 });
+
+// ---- auditor stage-4 gap list ------------------------------------------------------------------
+
+test('closure interval is half-open: bookings touching its edges are not considered (item 3)', async () => {
+  const { ada } = await world();
+  await book(ada, { table_id: 't_2', starts_at_local: `${date}T18:00` }); // ends 19:30
+  await book(ada, { table_id: 't_2', starts_at_local: `${date}T21:00` }); // starts at `to`
+  const res = (await preview(ada, close('t_2', date, '19:30', '21:00'))).body;
+  assert.deepEqual(res.assignments, []);
+});
+
+test('operator repair ignores diners\' cutoffs (item 9)', async () => {
+  const { ada } = await world({ restaurants: [restaurant({ cancellation_cutoff_minutes: 60 * 24 * 30 })] });
+  const r = (await book(ada, { table_id: 't_2' })).body;
+  expectError(await call('POST', `/reservations/${r.reference}/cancel`, { token: ada }), 409, 'cutoff_passed');
+  const plan = (await preview(ada, close('t_2'))).body;
+  assert.equal(plan.moved_count, 1);
+  assert.equal((await apply(ada, plan.plan_id)).status, 201);
+  // Party of 2: t_1 seats it with no unused seats.
+  assert.deepEqual((await call('GET', `/reservations/${r.reference}`, { token: ada })).body.table_ids, ['t_1']);
+});
+
+test('series amend with an empty eligible set succeeds without changes (item 44)', async () => {
+  const { ada, s } = await seriesWorld(2);
+  await call('PATCH', `/reservations/${s.occurrences[1].reference}`, { token: ada, body: { party_size: 3 } }); // exception
+  const rev = await revisionNow(ada);
+  const res = await amend(ada, s.series_id, { expected_revision: 2, from_index: 1, local_time: '20:00' });
+  assert.equal(res.status, 201);
+  assert.equal(res.body.revision, 2);
+  assert.equal(await revisionNow(ada), rev);
+  assert.equal(res.body.occurrences[1].reservation.starts_at_local, `${dayPlus(14)}T19:00`);
+});
+
+test('a replan can move a single-table booking onto a declared pair (item 52) and receipts stay valid (item 51)', async () => {
+  const { ada } = await world({ restaurants: [restaurant({ tables: [
+    { id: 't_1', label: '1', capacity: 2 }, { id: 't_2', label: '2', capacity: 4 }, { id: 't_3', label: '3', capacity: 6 }],
+  combinable: [['t_1', 't_2']] })] });
+  const key = newKey();
+  const r = (await book(ada, { table_id: 't_3', party_size: 6 }, key)).body;
+  const plan = (await preview(ada, close('t_3'))).body;
+  assert.deepEqual(plan.assignments, [{ reference: r.reference, table_ids: ['t_1', 't_2'], changed: true }]);
+  assert.equal(plan.unused_seats, 0);
+  const applied = (await apply(ada, plan.plan_id)).body;
+  const moved = applied.reservations[0];
+  assert.deepEqual(moved.table_ids, ['t_1', 't_2']);
+  assert.ok(!('table_id' in moved));
+  assert.deepEqual((await history(ada, r.reference)).at(-1).changes, [{ field: 'table_ids', from: ['t_3'], to: ['t_1', 't_2'] }]);
+  // The original create receipt still replays unchanged.
+  const replay = await book(ada, { table_id: 't_3', party_size: 6 }, key);
+  assert.equal(replay.status, 200);
+  assert.deepEqual(replay.body, r);
+  // And the decision reflects the unchanged terms with the new revision.
+  const decision = (await call('GET', `/reservations/${r.reference}/decision`, { token: ada })).body;
+  assert.deepEqual([decision.revision, decision.accepted_terms], [2, r.accepted_terms]);
+});
