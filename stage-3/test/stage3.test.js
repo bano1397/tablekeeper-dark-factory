@@ -442,3 +442,131 @@ test('stage-2 exports import; adoption works on imported reservations', async ()
   assert.equal((await call('POST', '/_test/import', { body: snap })).status, 204);
   assert.equal((await call('GET', `/series/${s.body.series_id}`, { token: ada })).status, 200);
 });
+
+// ---- auditor stage-3 gap list -------------------------------------------------------------
+
+test('explain on a fully unavailable slot and a closed day (items 4-5)', async () => {
+  const { ada, bob } = await world();
+  await book(ada, { table_id: 't_2', party_size: 2 });
+  await book(bob, { table_id: 't_3', party_size: 2 });
+  await book(ada, { table_id: 't_1', party_size: 2 });
+  const slot = (await call('GET', `/availability?restaurant_id=r_anker&date=${date}&party_size=2&explain=true`))
+    .body.slots.find((s) => s.starts_at_local.endsWith('19:00'));
+  assert.deepEqual(slot.available_table_ids, []);
+  assert.deepEqual(slot.explain.map((e) => [e.table_id, e.available, e.rules[0].holds, e.rules[1].holds, e.policy_version]),
+    [['t_1', false, true, false, 0], ['t_2', false, true, false, 0], ['t_3', false, true, false, 0]]);
+  const closed = WEEKDAYS.filter((d) => d !== WEEKDAYS[(new Date(`${date}T00:00:00Z`).getUTCDay() + 6) % 7])
+    .map((weekday) => ({ weekday, opens: '18:00', closes: '23:00' }));
+  await world({ restaurants: [restaurant({ opening_hours: closed })] });
+  assert.deepEqual((await call('GET', `/availability?restaurant_id=r_anker&date=${date}&party_size=2&explain=true`)).body.slots, []);
+});
+
+test('seq stays total under concurrent writes in the same second (item 11)', async () => {
+  const { ada } = await world();
+  const r = (await book(ada)).body;
+  await Promise.all([3, 4, 1, 2, 3].map((p) => patch(ada, r.reference, { party_size: p })));
+  const entries = await history(ada, r.reference);
+  assert.deepEqual(entries.map((e) => e.seq), entries.map((_, i) => i + 1));
+  assert.deepEqual(entries.map((e) => e.revision), entries.map((_, i) => i + 1));
+});
+
+test('managers do not gain access to other diners\' bookings (item 15)', async () => {
+  const { ada, bob } = await world(); // ada is the manager
+  const r = (await book(bob)).body;
+  for (const path of [`/reservations/${r.reference}`, `/reservations/${r.reference}/history`, `/reservations/${r.reference}/decision`]) {
+    expectError(await call('GET', path, { token: ada }), 404, 'not_found');
+  }
+  expectError(await call('POST', `/reservations/${r.reference}/cancel`, { token: ada }), 404, 'not_found');
+  expectError(await patch(ada, r.reference, { party_size: 1 }), 404, 'not_found');
+});
+
+test('a policy cannot change tables, labels, timezone or combinations (item 18)', async () => {
+  const { ada } = await world();
+  const res = await publish(ada, policy(date, {
+    tables: [{ id: 't_9', label: 'X', capacity: 9 }], timezone: 'America/New_York', combinable: [['t_1', 't_3']],
+  }));
+  assert.equal(res.status, 201);
+  assert.ok(!('tables' in res.body) && !('timezone' in res.body) && !('combinable' in res.body));
+  const detail = (await call('GET', '/restaurants/r_anker')).body;
+  assert.deepEqual(detail.tables.map((t) => t.id), ['t_1', 't_2', 't_3']);
+  assert.equal(detail.timezone, 'Europe/Berlin');
+  expectError(await book(ada, { table_id: undefined, table_ids: ['t_1', 't_3'], party_size: 5 }), 422, 'combination_not_allowed');
+});
+
+test('old idempotency keys replay the original revision and terms after a new policy (item 28)', async () => {
+  const { ada } = await world();
+  const key = newKey();
+  const first = (await book(ada, {}, key)).body;
+  await publish(ada, policy(dayPlus(-1), { reservation_duration_minutes: 60 }));
+  await patch(ada, first.reference, { party_size: 3 });
+  const replay = await book(ada, {}, key);
+  assert.equal(replay.status, 200);
+  assert.deepEqual(replay.body, first);
+  assert.equal(replay.body.accepted_terms.policy_version, 0);
+});
+
+test('adoption leaves the anchor history, timestamps and original receipt untouched (item 40)', async () => {
+  const { ada } = await world();
+  const key = newKey();
+  const anchor = (await book(ada, {}, key)).body;
+  const before = await history(ada, anchor.reference);
+  const s = (await call('POST', '/series', { token: ada, key: newKey(), body: { anchor_reference: anchor.reference, count: 2, interval_weeks: 1 } })).body;
+  assert.deepEqual(await history(ada, anchor.reference), before);
+  assert.deepEqual((await book(ada, {}, key)).body, anchor);
+  assert.deepEqual((await call('GET', `/reservations/${anchor.reference}`, { token: ada })).body, anchor);
+  assert.equal(s.occurrences[0].reference, anchor.reference);
+});
+
+test('a repeated local time in an occurrence uses the first occurrence (item 44)', async () => {
+  const { ada } = await world({ restaurants: [restaurant({ opening_hours: allWeek('00:00', '23:30') })] });
+  // 2027-10-31 is Berlin's fall-back date; 02:30 occurs twice and resolves to CEST (+02:00).
+  const anchor = (await book(ada, { starts_at_local: '2027-10-24T02:30' })).body;
+  const s = (await call('POST', '/series', { token: ada, key: newKey(), body: { anchor_reference: anchor.reference, count: 2, interval_weeks: 1 } })).body;
+  assert.equal(s.occurrences[1].reservation.starts_at, '2027-10-31T02:30:00+02:00');
+});
+
+test('series references and indices survive amendments; GET shows current state (items 47, 49)', async () => {
+  const { ada } = await world();
+  const anchor = (await book(ada)).body;
+  const s = (await call('POST', '/series', { token: ada, key: newKey(), body: { anchor_reference: anchor.reference, count: 2, interval_weeks: 1 } })).body;
+  const ref = s.occurrences[1].reference;
+  await patch(ada, ref, { starts_at_local: `${dayPlus(15)}T20:00`, table_id: 't_3' });
+  const cur = (await call('GET', `/series/${s.series_id}`, { token: ada })).body;
+  assert.deepEqual(cur.occurrences.map((o) => [o.index, o.reference]), [[0, anchor.reference], [1, ref]]);
+  assert.equal(cur.occurrences[1].reservation.starts_at_local, `${dayPlus(15)}T20:00`);
+  assert.equal(cur.occurrences[1].reservation.table_id, 't_3');
+  assert.equal(cur.occurrences[1].exception, true);
+});
+
+test('series on a combined-table anchor uses each date policy capacity for the pair (item 61)', async () => {
+  const { ada } = await world();
+  const anchor = (await book(ada, { table_id: undefined, table_ids: ['t_1', 't_2'], party_size: 6 })).body;
+  await publish(ada, policy(dayPlus(14), { capacities: { t_1: 2, t_2: 3, t_3: 6 } }));
+  expectError(await call('POST', '/series', { token: ada, key: newKey(), body: { anchor_reference: anchor.reference, count: 2, interval_weeks: 1 } }), 422, 'party_exceeds_capacity');
+  await publish(ada, policy(dayPlus(14), { capacities: { t_1: 3, t_2: 3, t_3: 6 } }));
+  const s = (await call('POST', '/series', { token: ada, key: newKey(), body: { anchor_reference: anchor.reference, count: 2, interval_weeks: 1 } })).body;
+  assert.deepEqual(s.occurrences[1].reservation.table_ids, ['t_1', 't_2']);
+  assert.equal(s.occurrences[1].reservation.accepted_terms.policy_version, 2);
+  assert.deepEqual((await history(ada, s.occurrences[1].reference))[0].changes[0], { field: 'table_ids', from: null, to: ['t_1', 't_2'] });
+});
+
+test('moves: old cutoff first, resulting-date policy adopted; replay changes nothing (items 62, 67)', async () => {
+  const { ada } = await world();
+  const past = (await book(ada, { starts_at_local: '2020-01-02T19:00' })).body;
+  const r = (await book(ada)).body;
+  const mv = (moves, key = newKey()) => call('POST', '/reservation-moves', { token: ada, key, body: { moves } });
+  expectError(await mv([{ reference: r.reference, party_size: 3 }, { reference: past.reference, party_size: 1 }]), 409, 'cutoff_passed');
+  assert.equal((await history(ada, r.reference)).length, 1);
+  await publish(ada, policy(dayPlus(9), { reservation_duration_minutes: 45 }));
+  const key = newKey();
+  const moves = [{ reference: r.reference, starts_at_local: `${dayPlus(9)}T19:00` }];
+  const ok = await mv(moves, key);
+  assert.equal(ok.status, 201);
+  assert.equal(ok.body.reservations[0].accepted_terms.policy_version, 1);
+  assert.equal(ok.body.reservations[0].ends_at.slice(11, 16), '19:45');
+  const replay = await mv(moves, key);
+  assert.equal(replay.status, 200);
+  assert.deepEqual(replay.body, ok.body);
+  assert.equal((await history(ada, r.reference)).length, 2);
+  assert.equal((await call('GET', `/reservations/${r.reference}`, { token: ada })).body.revision, 2);
+});
